@@ -1,12 +1,19 @@
 """Explicit API projections; private prompt text and provider secrets are never returned."""
 
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 from sqlalchemy import func, inspect, select
 from sqlalchemy.orm import Session
 
 from agentlab import models as m
 from agentlab.security import redact
+
+
+def iso_utc(value: date | datetime) -> str:
+    """SQLite drops tzinfo on read; persisted timestamps are UTC by contract."""
+    if isinstance(value, datetime) and value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.isoformat()
 
 
 def row(obj, exclude: tuple[str, ...] = ()) -> dict:
@@ -16,7 +23,7 @@ def row(obj, exclude: tuple[str, ...] = ()) -> dict:
         if key in exclude or key == "prompt_template":
             continue
         v = getattr(obj, key)
-        result[key] = v.isoformat() if isinstance(v, (datetime, date)) else redact(v)
+        result[key] = iso_utc(v) if isinstance(v, (datetime, date)) else redact(v)
     return result
 
 
@@ -91,13 +98,23 @@ def experiment(db: Session, ex: m.Experiment, *, details: bool = False) -> dict:
             "counts": counts,
         },
     }
+    if ex.completed_at or details:
+        q = select(m.Metric).where(m.Metric.experiment_id == ex.id)
+        if not details:
+            q = q.where(
+                m.Metric.key.in_(
+                    [
+                        "task_success_rate",
+                        "tool_accuracy",
+                        "robustness_rate",
+                        "average_latency_ms",
+                        "estimated_cost_usd",
+                        "cost_per_success_usd",
+                    ]
+                )
+            )
+        data["metrics"] = [row(x) for x in db.scalars(q.order_by(m.Metric.key)).all()]
     if details:
-        data["metrics"] = [
-            row(x)
-            for x in db.scalars(
-                select(m.Metric).where(m.Metric.experiment_id == ex.id).order_by(m.Metric.key)
-            ).all()
-        ]
         runs = db.scalars(
             select(m.ExperimentRun)
             .where(m.ExperimentRun.experiment_id == ex.id)
@@ -157,6 +174,13 @@ def failure(db: Session, f: m.Failure, *, details: bool = False) -> dict:
     task = db.get(m.Task, f.task_id)
     v = db.get(m.AgentVersion, f.agent_version_id)
     a = db.get(m.Agent, v.agent_id)
+    window = db.execute(
+        select(func.min(m.Failure.detected_at), func.max(m.Failure.detected_at)).where(
+            m.Failure.experiment_id == f.experiment_id,
+            m.Failure.task_id == f.task_id,
+            m.Failure.failure_type == f.failure_type,
+        )
+    ).one()
     data = {
         **row(f),
         "task_key": task.task_key,
@@ -164,6 +188,8 @@ def failure(db: Session, f: m.Failure, *, details: bool = False) -> dict:
         "agent_name": a.name,
         "agent_version": v.version,
         "is_demo": a.is_demo,
+        "first_seen": iso_utc(window[0] if window[0] else f.detected_at),
+        "last_seen": iso_utc(window[1] if window[1] else f.detected_at),
     }
     if details:
         sibling_failures = db.scalars(
@@ -187,8 +213,8 @@ def failure(db: Session, f: m.Failure, *, details: bool = False) -> dict:
         data["frequency"] = {
             "failures": len(sibling_failures),
             "runs": attempts,
-            "first_seen": min(x.detected_at for x in sibling_failures).isoformat(),
-            "last_seen": max(x.detected_at for x in sibling_failures).isoformat(),
+            "first_seen": iso_utc(min(x.detected_at for x in sibling_failures)),
+            "last_seen": iso_utc(max(x.detected_at for x in sibling_failures)),
         }
         data["reproductions"] = [
             {**row(r), "experiment_status": db.get(m.Experiment, r.experiment_id).status}

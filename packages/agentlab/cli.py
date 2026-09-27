@@ -143,11 +143,15 @@ def regression_compare(baseline_experiment_id: str, candidate_experiment_id: str
 @report.command("generate")
 def report_generate(
     experiment_id: str,
-    format: str = typer.Option("md", "--format", help="md | json | html"),
+    format: str = typer.Option("md", "--format", help="pdf | md | json | html"),
     out: Path | None = typer.Option(None, "--out"),
 ):
-    if format not in {"md", "json", "html"}:
-        raise typer.BadParameter("Format must be md, json or html")
+    if format not in {"pdf", "md", "json", "html"}:
+        raise typer.BadParameter("Format must be pdf, md, json or html")
+    if format == "pdf" and out is None:
+        raise typer.BadParameter(
+            "PDF output requires --out PATH (binary data cannot print to terminal)"
+        )
     r = call("POST", "/reports", {"experiment_id": experiment_id})
     base = os.getenv("AGENTLAB_API_URL", "http://localhost:8000").rstrip("/")
     headers = {"X-API-Key": os.environ["AGENTLAB_API_KEY"]} if os.getenv("AGENTLAB_API_KEY") else {}

@@ -16,6 +16,7 @@ from agentlab.demo import seed
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 from agentlab_api.routers import (
     agents,
@@ -24,6 +25,7 @@ from agentlab_api.routers import (
     demo,
     experiments,
     failures,
+    monitoring,
     reports,
     traces,
 )
@@ -108,9 +110,17 @@ async def security_and_observability(request: Request, call_next):
     try:
         if request.method in {"POST", "PUT", "PATCH"}:
             header = request.headers.get("content-length")
-            if header and int(header) > cfg.max_request_bytes:
-                status = 413
-                return JSONResponse({"detail": "Request exceeds size limit"}, status_code=status)
+            if header:
+                try:
+                    declared_size = int(header)
+                except ValueError:
+                    status = 400
+                    return JSONResponse({"detail": "Invalid Content-Length"}, status_code=status)
+                if declared_size > cfg.max_request_bytes:
+                    status = 413
+                    return JSONResponse(
+                        {"detail": "Request exceeds size limit"}, status_code=status
+                    )
             # Bound chunked requests too; request._body is consumed by the downstream FastAPI parser.
             chunks = []
             length = 0
@@ -210,5 +220,15 @@ for router in (
     analytics.router,
     reports.router,
     demo.router,
+    monitoring.router,
 ):
     app.include_router(router)
+
+
+@app.exception_handler(IntegrityError)
+def integrity_conflict(request: Request, exc: IntegrityError):
+    # Avoid disclosing raw SQL/parameters; DB uniqueness is the final concurrency guard.
+    return JSONResponse(
+        {"detail": "Unique constraint conflict; names and version IDs are immutable"},
+        status_code=409,
+    )

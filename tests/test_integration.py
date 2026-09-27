@@ -1,5 +1,7 @@
 import time
 
+import pytest
+
 
 def wait_completed(client, experiment_id: str, timeout: float = 30):
     deadline = time.monotonic() + timeout
@@ -21,6 +23,7 @@ def test_api_registration_benchmark_run_trace_failure(client):
         },
     )
     assert agent.status_code == 201, agent.text
+    assert agent.json()["is_demo"] is True  # every mock agent must be transparently labeled DEMO
     aid = agent.json()["versions"][0]["id"]
     benchmark = client.post(
         "/benchmarks",
@@ -44,7 +47,9 @@ def test_api_registration_benchmark_run_trace_failure(client):
         },
     )
     assert ex.status_code == 201, ex.text
+    assert ex.json()["is_demo"] is True
     eid = ex.json()["id"]
+    assert ex.json()["created_at"].endswith("+00:00")
     assert client.post(f"/experiments/{eid}/run").status_code == 200
     assert client.post(f"/experiments/{eid}/run").status_code == 200  # idempotent
     finished = wait_completed(client, eid)
@@ -58,10 +63,34 @@ def test_api_registration_benchmark_run_trace_failure(client):
     trace = client.get("/traces/" + f["trace_id"]).json()
     assert any(event["event_type"] == "FINAL_RESPONSE" for event in trace["events"])
     assert client.get("/evaluations", params={"experiment_id": eid}).status_code == 200
+    pages = [
+        client.get(f"/experiments/{eid}/runs", params={"limit": 2, "offset": i}).json()
+        for i in (0, 2, 4)
+    ]
+    assert all(len(page) == 2 for page in pages)
+    assert len({r["id"] for page in pages for r in page}) == 6
+    assert all(r["task_key"] and r["trace_id"] for page in pages for r in page)
+    distribution = client.get(f"/experiments/{eid}/task-distribution").json()
+    assert [
+        (t["passed"], t["n"], t["observed_sample_variance"]) for t in distribution["tasks"]
+    ] == [(0, 3, 0.0), (3, 3, 0.0)]
+    assert distribution["agent_version_id"] == aid
+    assert distribution["benchmark_version_id"] == bv
+    ops = client.get("/system/metrics").json()
+    assert ops["queued_runs"] == 0 and ops["running_runs"] == 0
+    assert ops["evaluated_runs_last_hour"] == 6 and ops["worker_latency_samples"] == 6
+    assert ops["worker_run_latency_p95_ms"] is not None
     report = client.post("/reports", json={"experiment_id": eid})
     assert report.status_code == 201, report.text
+    assert client.get("/reports/" + report.json()["id"]).json()["content_json"]["demo"] is True
+    assert client.get("/reports").json()[0]["is_demo"] is True
     md = client.get("/reports/" + report.json()["id"] + "/download?format=md").text
     assert "50 %" in md and "Not measured" in md and "Reproduction instructions" in md
+    pdf = client.get("/reports/" + report.json()["id"] + "/download?format=pdf")
+    assert pdf.status_code == 200 and pdf.content.startswith(b"%PDF-")
+    assert pdf.headers["content-type"] == "application/pdf"
+    assert len(pdf.content) > 3000
+    assert client.get("/reports/" + report.json()["id"] + "/download?format=x").status_code == 400
     assert client.post(f"/experiments/{eid}/cancel").status_code == 409
     assert client.get("/metrics/definitions").json()[0]["formula"]
 
@@ -124,12 +153,18 @@ def test_demo_real_execution_regression_replay_robustness_report(client):
     robust_result = wait_completed(client, ex.json()["id"])
     metric = next(x for x in robust_result["metrics"] if x["key"] == "robustness_rate")
     assert metric["sample_count"] == 4 and metric["value"] == 50
+    usage = client.get("/cost/summary", params={"experiment_id": ex.json()["id"]}).json()
+    assert usage["api_calls"] is None  # failed tool runs never invent 0 remote API attempts
+    assert usage["api_call_coverage"] == "2/4"
     report = client.post("/reports", json={"experiment_id": candidate_id})
     assert report.status_code == 201
     doc = client.get("/reports/" + report.json()["id"]).json()["content_json"]
     assert doc["demo"] and doc["benchmark"]["version"] and doc["failures"]
     html = client.get("/reports/" + report.json()["id"] + "/download?format=html")
     assert html.status_code == 200 and "DEMO · SYNTHETIC" in html.text
+    pdf = client.get("/reports/" + report.json()["id"] + "/download?format=pdf")
+    assert pdf.status_code == 200 and pdf.content.startswith(b"%PDF-")
+    assert b"DEMO / SYNTHETIC" in pdf.content or len(pdf.content) > 5000
 
 
 def test_auth_and_no_credentials_in_api(client, monkeypatch):
@@ -164,3 +199,81 @@ def test_auth_and_no_credentials_in_api(client, monkeypatch):
         ).status_code
         == 422
     )
+
+
+def test_broker_dispatch_failure_is_sanitized_and_queued_runs_are_recoverable(client, monkeypatch):
+    from agentlab import executions
+
+    seeded = client.post("/demo/seed").json()
+    benchmark = client.get("/benchmarks/" + seeded["benchmark_id"]).json()
+    task_id = benchmark["versions"][0]["tasks"][0]["id"]
+    response = client.post(
+        "/experiments",
+        json={
+            "name": "Recoverable broker failure",
+            "agent_version_id": seeded["v1_id"],
+            "benchmark_version_id": seeded["benchmark_version_id"],
+            "task_ids": [task_id],
+        },
+    )
+    assert response.status_code == 201
+    eid = response.json()["id"]
+    original_dispatch = executions.dispatch_experiment
+
+    def broken_dispatch(_):
+        raise RuntimeError("redis://:hidden-credential@broker:6379")
+
+    monkeypatch.setattr(executions, "dispatch_experiment", broken_dispatch)
+    failure = client.post(f"/experiments/{eid}/run")
+    assert failure.status_code == 503
+    assert "hidden-credential" not in failure.text
+    assert client.get(f"/experiments/{eid}").json()["progress"]["counts"] == {"QUEUED": 1}
+    assert client.get("/system/metrics").json()["queued_runs"] == 1
+    monkeypatch.setattr(executions, "dispatch_experiment", original_dispatch)
+    resumed = client.post(f"/experiments/{eid}/resume")
+    assert resumed.status_code == 200 and resumed.json()["jobs_dispatched"] == 1
+    assert wait_completed(client, eid)["progress"]["completed"] == 1
+
+
+def test_production_guards_viewer_permissions_and_api_rate_limit(client, monkeypatch):
+    import agentlab_api.main as api
+    from agentlab.config import Settings
+
+    with pytest.raises(RuntimeError, match="Production requires"):
+        Settings(
+            env="production",
+            auth_mode="disabled",
+            api_key="x" * 40,
+            database_url="sqlite:///test.db",
+            queue_mode="local-thread",
+        ).validate_deployment()
+    assert (
+        Settings(
+            env="production",
+            auth_mode="required",
+            api_key="x" * 40,
+            database_url="postgresql+psycopg://example:pass@postgres:5432/db",
+            queue_mode="celery",
+        ).validate_deployment()
+        is None
+    )
+    cfg = Settings(
+        env="test",
+        auth_mode="required",
+        api_key="test-admin-key",
+        readonly_api_key="test-viewer-key",
+        database_url="sqlite:///unused",
+        queue_mode="local-thread",
+        rate_limit_per_minute=3,
+    )
+    monkeypatch.setattr(api, "settings", lambda: cfg)
+    headers = {"X-API-Key": "test-viewer-key"}
+    assert client.get("/system/metrics", headers=headers).status_code == 200
+    assert client.post("/demo/seed", headers=headers).status_code == 403
+    assert client.post("/demo/seed", headers={"X-API-Key": "test-admin-key"}).status_code == 200
+    assert client.get("/overview", headers=headers).status_code == 200
+    assert client.get("/agents", headers=headers).status_code == 200
+    too_many = client.get("/agents", headers=headers)
+    assert too_many.status_code == 429
+    assert too_many.headers["Retry-After"] == "60"
+    assert client.get("/health").status_code == 200  # public readiness skips the rate limit

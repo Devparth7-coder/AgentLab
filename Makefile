@@ -1,4 +1,4 @@
-.PHONY: dev test lint format migrate seed down api web worker
+.PHONY: dev test test-e2e lint format migrate seed down api web worker
 
 dev:
 	docker compose up --build -d
@@ -19,8 +19,13 @@ worker:
 test:
 	pytest -q
 	npm --prefix apps/web run typecheck
+test-e2e:
+	@echo "Requires running API and web UI (make dev or make api + make web)"
+	npm --prefix apps/web run test:e2e
+
 lint:
 	ruff check packages apps/api tests
+	npm --prefix apps/web run lint
 	npm --prefix apps/web run typecheck
 format:
 	ruff format packages apps/api tests

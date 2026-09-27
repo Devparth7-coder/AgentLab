@@ -24,12 +24,15 @@ class TraceRecorder:
         allowed_tools: list[str],
         capture: str = "redacted",
         fail_first_tool: str | None = None,
+        fault_policy: str | None = None,
     ):
         self.start = perf_counter()
         self.allowed_tools = allowed_tools
         self.capture = capture
         self.fail_first_tool = fail_first_tool
+        self.fault_policy = fault_policy
         self.fault_consumed = False
+        self.fault_attempts = 0
         self.events: list[dict] = []
         self.calls: list[dict] = []
 
@@ -72,10 +75,25 @@ class TraceRecorder:
         seq = self.event("TOOL_CALL", tool_name=name, input_metadata={"arguments": arguments})
         start = perf_counter()
         try:
-            if name == self.fail_first_tool and not self.fault_consumed:
-                self.fault_consumed = True
-                raise RuntimeError("Injected sandbox tool failure (robustness test)")
+            if name == self.fail_first_tool:
+                self.fault_attempts += 1
+                if (
+                    self.fault_policy == "tool_unavailable"
+                    or (self.fault_policy == "repeated_failures" and self.fault_attempts <= 2)
+                    or (self.fault_policy == "tool_failure" and not self.fault_consumed)
+                ):
+                    self.fault_consumed = True
+                    raise RuntimeError("Injected sandbox tool failure (robustness test)")
             result = execute(name, arguments, self.allowed_tools)
+            if (
+                name == self.fail_first_tool
+                and self.fault_policy == "invalid_tool_response"
+                and not self.fault_consumed
+            ):
+                self.fault_consumed = True
+                result = {
+                    "malformed_fixture": True
+                }  # deliberate invalid shape, not an external tool result
             status, error = "SUCCESS", None
         except (ValueError, RuntimeError, ZeroDivisionError) as exc:
             result = {"error": str(exc)}

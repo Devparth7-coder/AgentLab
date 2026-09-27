@@ -1,5 +1,6 @@
 """HTTP model adapters. Endpoints and secrets ONLY from server environment; tools sandboxed."""
 
+import asyncio
 import json
 import os
 from urllib.parse import quote
@@ -33,22 +34,44 @@ def _endpoint(env: str, default: str, *, local: bool = False) -> str:
 
 
 async def _post(url: str, headers: dict, payload: dict) -> dict:
-    try:
-        async with httpx.AsyncClient(
-            timeout=settings().provider_timeout_seconds, follow_redirects=False
-        ) as client:
-            response = await client.post(url, headers=headers, json=payload)
-            response.raise_for_status()
-            data = response.json()
-            if not isinstance(data, dict):
-                raise ProviderError("Provider response must be a JSON object")
-            return data
-    except httpx.TimeoutException as exc:
-        raise ProviderError("Provider request timed out") from exc
-    except httpx.HTTPStatusError as exc:
-        raise ProviderError(f"Provider returned HTTP {exc.response.status_code}") from exc
-    except (httpx.RequestError, ValueError) as exc:
-        raise ProviderError("Provider request failed or response was invalid") from exc
+    """Three bounded attempts on transient failures; POST retries may incur duplicate provider fees."""
+    retryable = {408, 429, 500, 502, 503, 504}
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(
+                timeout=settings().provider_timeout_seconds, follow_redirects=False
+            ) as client:
+                response = await client.post(url, headers=headers, json=payload)
+                response.raise_for_status()
+                data = response.json()
+                if not isinstance(data, dict):
+                    raise ProviderError("Provider response must be a JSON object")
+                # Internal metadata: count actual HTTP attempts, including retries.
+                data["__agentlab_attempts"] = attempt + 1
+                return data
+        except httpx.HTTPStatusError as exc:
+            code = exc.response.status_code
+            if attempt == 2 or code not in retryable:
+                raise ProviderError(f"Provider returned HTTP {code}") from exc
+            numeric_delay = exc.response.headers.get("retry-after", "")
+            try:
+                delay = (
+                    min(max(float(numeric_delay), 0), 5) if numeric_delay else 0.5 * (2**attempt)
+                )
+            except ValueError:
+                delay = 0.5 * (2**attempt)
+        except httpx.TimeoutException as exc:
+            if attempt == 2:
+                raise ProviderError("Provider request timed out after 3 attempts") from exc
+            delay = 0.5 * (2**attempt)
+        except httpx.RequestError as exc:
+            if attempt == 2:
+                raise ProviderError("Provider request failed after 3 attempts") from exc
+            delay = 0.5 * (2**attempt)
+        except ValueError as exc:
+            raise ProviderError("Provider response was invalid JSON") from exc
+        await asyncio.sleep(delay)
+    raise ProviderError("Provider retry budget exhausted")
 
 
 def _tool_specs(ctx: AgentContext, anthropic: bool = False) -> list[dict]:
@@ -74,7 +97,12 @@ def _parse_args(value) -> dict:
 
 
 def _usage_add(previous: int | None, added: int | None) -> int | None:
-    return previous + added if previous is not None and isinstance(added, int) else None
+    return previous + added if previous is not None and type(added) is int and added >= 0 else None
+
+
+def _attempts(data: dict) -> int:
+    count = data.pop("__agentlab_attempts", 1)
+    return count if type(count) is int and 1 <= count <= 3 else 1
 
 
 class OpenAIProvider(AgentProvider):
@@ -107,7 +135,7 @@ class OpenAIProvider(AgentProvider):
             if tools:
                 payload["tools"] = tools
             data = await _post(endpoint, headers, payload)
-            calls += 1
+            calls += _attempts(data)
             usage = data.get("usage") or {}
             input_tokens = _usage_add(input_tokens, usage.get("prompt_tokens"))
             output_tokens = _usage_add(output_tokens, usage.get("completion_tokens"))
@@ -167,7 +195,8 @@ class AnthropicProvider(AgentProvider):
         specs = _tool_specs(ctx, anthropic=True)
         inp: int | None = 0
         out: int | None = 0
-        for call_index in range(5):
+        calls = 0
+        for _ in range(5):
             payload = {
                 "model": ctx.version.model,
                 "max_tokens": ctx.version.max_tokens,
@@ -179,6 +208,7 @@ class AnthropicProvider(AgentProvider):
             if specs:
                 payload["tools"] = specs
             data = await _post(url, headers, payload)
+            calls += _attempts(data)
             usage = data.get("usage") or {}
             inp = _usage_add(inp, usage.get("input_tokens"))
             out = _usage_add(out, usage.get("output_tokens"))
@@ -191,7 +221,7 @@ class AnthropicProvider(AgentProvider):
                     ),
                     input_tokens=inp,
                     output_tokens=out,
-                    api_calls=call_index + 1,
+                    api_calls=calls,
                 )
             messages.append({"role": "assistant", "content": blocks})
             feedback = []
@@ -236,7 +266,8 @@ class GeminiProvider(AgentProvider):
         ]
         inp: int | None = 0
         out: int | None = 0
-        for call_index in range(5):
+        calls = 0
+        for _ in range(5):
             payload = {
                 "contents": contents,
                 "generationConfig": {
@@ -249,6 +280,7 @@ class GeminiProvider(AgentProvider):
             if declarations:
                 payload["tools"] = [{"functionDeclarations": declarations}]
             data = await _post(url, headers, payload)
+            calls += _attempts(data)
             usage = data.get("usageMetadata") or {}
             inp = _usage_add(inp, usage.get("promptTokenCount"))
             out = _usage_add(out, usage.get("candidatesTokenCount"))
@@ -263,7 +295,7 @@ class GeminiProvider(AgentProvider):
                     output="\n".join(str(part.get("text", "")) for part in parts),
                     input_tokens=inp,
                     output_tokens=out,
-                    api_calls=call_index + 1,
+                    api_calls=calls,
                 )
             contents.append({"role": "model", "parts": parts})
             replies = []
@@ -292,7 +324,8 @@ class OllamaProvider(AgentProvider):
         specs = _tool_specs(ctx)
         inp: int | None = 0
         out: int | None = 0
-        for call_index in range(5):
+        calls = 0
+        for _ in range(5):
             payload = {
                 "model": ctx.version.model,
                 "messages": messages,
@@ -305,6 +338,7 @@ class OllamaProvider(AgentProvider):
             if specs:
                 payload["tools"] = [{"type": "function", "function": spec} for spec in specs]
             data = await _post(url, {}, payload)
+            calls += _attempts(data)
             inp = _usage_add(inp, data.get("prompt_eval_count"))
             out = _usage_add(out, data.get("eval_count"))
             message = data.get("message") or {}
@@ -314,7 +348,7 @@ class OllamaProvider(AgentProvider):
                     output=str(message.get("content") or ""),
                     input_tokens=inp,
                     output_tokens=out,
-                    api_calls=call_index + 1,
+                    api_calls=calls,
                 )
             messages.append(message)
             for call in tool_calls:
@@ -340,7 +374,8 @@ class CustomHTTPProvider(AgentProvider):
         tool_results = []
         inp: int | None = 0
         out: int | None = 0
-        for call_index in range(5):
+        calls = 0
+        for _ in range(5):
             data = await _post(
                 url,
                 headers,
@@ -358,22 +393,23 @@ class CustomHTTPProvider(AgentProvider):
                     },
                 },
             )
+            calls += _attempts(data)
             usage = data.get("usage") or {}
             inp = _usage_add(inp, usage.get("input_tokens"))
             out = _usage_add(out, usage.get("output_tokens"))
-            calls = data.get("tool_calls") or []
-            if not calls:
+            tool_calls = data.get("tool_calls") or []
+            if not tool_calls:
                 return AgentResult(
                     output=str(data.get("output", "")),
                     input_tokens=inp,
                     output_tokens=out,
-                    api_calls=call_index + 1,
+                    api_calls=calls,
                     ttft_ms=data.get("ttft_ms")
                     if isinstance(data.get("ttft_ms"), (int, float))
                     else None,
                 )
             tool_results = []
-            for call in calls:
+            for call in tool_calls:
                 name = call.get("name", "")
                 outcome = ctx.recorder.call_tool(name, _parse_args(call.get("arguments")))
                 tool_results.append(

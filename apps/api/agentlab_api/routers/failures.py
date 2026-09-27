@@ -2,7 +2,7 @@ from datetime import datetime
 
 from agentlab import models as m
 from agentlab.db import get_db
-from agentlab.executions import create_experiment, dispatch_experiment, queue_experiment
+from agentlab.executions import create_experiment, queue_experiment
 from agentlab.schemas import ExperimentIn, ListFilter
 from agentlab.serializers import failure as serialize_failure
 from agentlab.serializers import row
@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, Request
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
-from agentlab_api.common import audit, bad, found
+from agentlab_api.common import audit, bad, dispatch_or_unavailable, found
 
 router = APIRouter(prefix="/failures", tags=["Failure explorer & replay"])
 
@@ -112,7 +112,7 @@ def replay(failure_id: str, request: Request, db: Session = Depends(get_db)):
         queue_experiment(db, ex)
         audit(db, request, "failure.replay", "failure", f.id, {"new_experiment_id": ex.id})
         db.commit()
-        dispatch_experiment(ex.id)
+        dispatch_or_unavailable(ex.id)
         return {
             "reproduction": row(repro),
             "experiment_id": ex.id,

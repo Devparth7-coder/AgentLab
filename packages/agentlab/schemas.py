@@ -102,9 +102,22 @@ class RobustnessIn(StrictModel):
     benchmark_version_id: str
     transformations: list[
         Literal[
-            "whitespace", "wording", "irrelevant", "noise", "conflict", "malformed", "tool_failure"
+            "whitespace",
+            "wording",
+            "irrelevant",
+            "noise",
+            "conflict",
+            "malformed",
+            "tool_failure",
+            "ambiguity",
+            "adversarial",
+            "long_context",
+            "distractor",
+            "invalid_tool_response",
+            "tool_unavailable",
+            "repeated_failures",
         ]
-    ] = Field(min_length=1, max_length=7)
+    ] = Field(min_length=1, max_length=14)
     seed: int = Field(default=42, ge=0)
     limit: int = Field(default=50, ge=1, le=200)
 

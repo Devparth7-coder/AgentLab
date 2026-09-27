@@ -2,10 +2,10 @@ from agentlab import models as m
 from agentlab.db import get_db
 from agentlab.executions import (
     create_experiment,
-    dispatch_experiment,
     queue_experiment,
     resume_experiment,
 )
+from agentlab.metrics import wilson_ci
 from agentlab.schemas import ExperimentIn, ListFilter
 from agentlab.serializers import experiment as serialize_experiment
 from agentlab.serializers import row
@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from agentlab_api.common import audit, bad, found
+from agentlab_api.common import audit, bad, dispatch_or_unavailable, found
 
 router = APIRouter(tags=["Experiments & evaluations"])
 
@@ -70,6 +70,72 @@ def detail(experiment_id: str, db: Session = Depends(get_db)):
     return serialize_experiment(db, found(db, m.Experiment, experiment_id), details=True)
 
 
+@router.get(
+    "/experiments/{experiment_id}/runs", summary="Paginated task/run records for large experiments"
+)
+def run_page(experiment_id: str, limit: int = 200, offset: int = 0, db: Session = Depends(get_db)):
+    found(db, m.Experiment, experiment_id)
+    f = ListFilter(limit=limit, offset=offset)
+    runs = db.scalars(
+        select(m.ExperimentRun)
+        .where(m.ExperimentRun.experiment_id == experiment_id)
+        .order_by(m.ExperimentRun.task_id, m.ExperimentRun.run_index)
+        .offset(f.offset)
+        .limit(f.limit)
+    ).all()
+    return [
+        {
+            **row(r),
+            "task_key": db.get(m.Task, r.task_id).task_key,
+            "trace_id": db.scalar(select(m.Trace.id).where(m.Trace.run_id == r.id)),
+            "failure_id": db.scalar(select(m.Failure.id).where(m.Failure.run_id == r.id)),
+        }
+        for r in runs
+    ]
+
+
+@router.get(
+    "/experiments/{experiment_id}/task-distribution",
+    summary="Per-task N-run success, Wilson interval and observed Bernoulli variance",
+)
+def task_distribution(experiment_id: str, db: Session = Depends(get_db)):
+    ex = found(db, m.Experiment, experiment_id)
+    runs = db.scalars(select(m.ExperimentRun).where(m.ExperimentRun.experiment_id == ex.id)).all()
+    by_task: dict[str, list[m.ExperimentRun]] = {}
+    for run in runs:
+        by_task.setdefault(run.task_id, []).append(run)
+    items = []
+    for task_id, trials in by_task.items():
+        evaluated = [r for r in trials if r.status in {"PASSED", "FAILED", "ERROR"}]
+        n = len(evaluated)
+        passed = sum(r.status == "PASSED" for r in evaluated)
+        rate = passed / n if n else None
+        items.append(
+            {
+                "task_id": task_id,
+                "task_key": db.get(m.Task, task_id).task_key,
+                "n": n,
+                "passed": passed,
+                "failed": sum(r.status == "FAILED" for r in evaluated),
+                "errors": sum(r.status == "ERROR" for r in evaluated),
+                "cancelled": sum(r.status == "CANCELLED" for r in trials),
+                "success_rate_percent": round(rate * 100, 6) if rate is not None else None,
+                "wilson_95_ci_percent": wilson_ci(passed, n),
+                "observed_sample_variance": round((passed * (n - passed)) / (n * (n - 1)), 6)
+                if n > 1
+                else None,
+            }
+        )
+    return {
+        "experiment_id": ex.id,
+        "agent_version_id": ex.agent_version_id,
+        "benchmark_version_id": ex.benchmark_version_id,
+        "evaluation_version": ex.evaluation_version,
+        "tasks": sorted(items, key=lambda x: x["task_key"]),
+        "note": "Bernoulli sample variance p(1-p)*n/(n-1) for n>=2; 95% Wilson intervals describe uncertainty, not significance.",
+    }
+
+
 @router.post(
     "/experiments/{experiment_id}/run", summary="Enqueue per-task jobs without blocking the API"
 )
@@ -80,11 +146,11 @@ def run(experiment_id: str, request: Request, db: Session = Depends(get_db)):
         queue_experiment(db, ex)
         audit(db, request, "experiment.enqueue", "experiment", ex.id, {"fresh": fresh})
         db.commit()
-        dispatched = dispatch_experiment(ex.id) if fresh else 0
-        return {"experiment": serialize_experiment(db, ex), "jobs_dispatched": dispatched}
-    except Exception as exc:
+    except ValueError as exc:
         db.rollback()
-        bad(exc, status_code=503 if "broker" in str(exc).lower() else 400)
+        bad(exc)
+    dispatched = dispatch_or_unavailable(ex.id) if fresh else 0
+    return {"experiment": serialize_experiment(db, ex), "jobs_dispatched": dispatched}
 
 
 @router.post(
@@ -114,10 +180,7 @@ def resume(
         {"queued": len(ids), "operator_opted_into_stale_recovery": recover_stale},
     )
     db.commit()
-    try:
-        count = dispatch_experiment(ex.id) if ids else 0
-    except Exception as exc:
-        bad(exc, 503)
+    count = dispatch_or_unavailable(ex.id) if ids else 0
     return {
         "experiment_id": ex.id,
         "jobs_dispatched": count,

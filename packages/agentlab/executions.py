@@ -50,10 +50,11 @@ def create_experiment(
     b = db.get(m.Benchmark, benchmark.benchmark_id)
     config = data.model_dump()
     env = {
-        "runtime": os.getenv("AGENTLAB_ENV", "development"),
-        "queue_mode": settings().queue_mode,
         **data.environment,
+        "runtime": settings().env,
+        "queue_mode": settings().queue_mode,
     }
+    git_commit = os.getenv("GIT_COMMIT", "unknown")
     exp = m.Experiment(
         name=data.name,
         agent_version_id=version.id,
@@ -67,13 +68,15 @@ def create_experiment(
                 **config,
                 "agent_hash": version.configuration_hash,
                 "benchmark_hash": benchmark.content_hash,
+                "effective_environment": env,
+                "git_commit": git_commit,
                 "evaluation_version": EVALUATION_VERSION,
             }
         ),
         evaluation_version=EVALUATION_VERSION,
         environment=env,
-        git_commit=os.getenv("GIT_COMMIT", "unknown"),
-        is_demo=bool(a.is_demo or b.is_demo),
+        git_commit=git_commit,
+        is_demo=bool(a.is_demo or b.is_demo or a.provider == "mock"),
         replay_of_failure_id=replay_of_failure_id,
     )
     db.add(exp)
@@ -172,13 +175,20 @@ def process_run(run_id: str) -> None:
         version = db.get(m.AgentVersion, exp.agent_version_id)
         agent = db.get(m.Agent, version.agent_id)
         allowed = sorted(set(task.available_tools) & set(version.tool_configuration))
+        fault = task.task_metadata.get("perturbation")
         recorder = TraceRecorder(
             allowed,
             capture=settings().trace_capture,
             fail_first_tool=allowed[0]
-            if task.task_metadata.get("perturbation") == "tool_failure" and allowed
+            if fault
+            in {"tool_failure", "invalid_tool_response", "tool_unavailable", "repeated_failures"}
+            and allowed
             else None,
+            fault_policy=fault,
         )
+        # Release DB connection during long external calls. Version/task snapshots are immutable.
+        db.expunge_all()
+        db.close()
         recorder.event(
             "TASK_STARTED",
             input_metadata={
@@ -276,7 +286,7 @@ def process_run(run_id: str) -> None:
                     db2.add(
                         m.CostRecord(
                             run_id=run_id,
-                            api_calls=result.api_calls if result else 0,
+                            api_calls=result.api_calls if result else None,
                             input_tokens=usage["input_tokens"],
                             output_tokens=usage["output_tokens"],
                             total_tokens=usage["total_tokens"],

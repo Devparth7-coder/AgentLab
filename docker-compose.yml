@@ -3,7 +3,7 @@ services:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: agentlab
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-agentlab}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: agentlab
     volumes: ["pgdata:/var/lib/postgresql/data"]
     healthcheck:
@@ -24,24 +24,21 @@ services:
       dockerfile: docker/Dockerfile.api
     environment:
       AGENTLAB_ENV: ${AGENTLAB_ENV:-development}
-      AGENTLAB_DATABASE_URL: postgresql+psycopg://agentlab:${POSTGRES_PASSWORD:-agentlab}@postgres:5432/agentlab
+      GIT_COMMIT: ${GIT_COMMIT:-unknown}
+      AGENTLAB_DATABASE_URL: postgresql+psycopg://agentlab:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/agentlab
       AGENTLAB_REDIS_URL: redis://redis:6379/0
       AGENTLAB_QUEUE_MODE: celery
       AGENTLAB_AUTH_MODE: required
       AGENTLAB_API_KEY: ${AGENTLAB_API_KEY:?Set AGENTLAB_API_KEY in .env}
+      AGENTLAB_READONLY_API_KEY: ${AGENTLAB_READONLY_API_KEY:-}
+      AGENTLAB_MAX_REQUEST_BYTES: ${AGENTLAB_MAX_REQUEST_BYTES:-1048576}
+      AGENTLAB_RATE_LIMIT_PER_MINUTE: ${AGENTLAB_RATE_LIMIT_PER_MINUTE:-180}
       AGENTLAB_DEMO_SEED: ${AGENTLAB_DEMO_SEED:-true}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
-      HF_TOKEN: ${HF_TOKEN:-}
-      AGENTLAB_OPENAI_BASE_URL: ${AGENTLAB_OPENAI_BASE_URL:-https://api.openai.com/v1}
-      AGENTLAB_OLLAMA_BASE_URL: ${AGENTLAB_OLLAMA_BASE_URL:-http://host.docker.internal:11434}
-      AGENTLAB_CUSTOM_HTTP_URL: ${AGENTLAB_CUSTOM_HTTP_URL:-}
     command: ["sh", "-c", "alembic upgrade head && uvicorn agentlab_api.main:app --host 0.0.0.0 --port 8000"]
     depends_on:
       postgres: {condition: service_healthy}
       redis: {condition: service_healthy}
-    ports: ["8000:8000"]
+    ports: ["${AGENTLAB_BIND_ADDRESS:-127.0.0.1}:8000:8000"]
     restart: unless-stopped
   worker:
     build:
@@ -49,11 +46,17 @@ services:
       dockerfile: docker/Dockerfile.api
     environment:
       AGENTLAB_ENV: ${AGENTLAB_ENV:-development}
-      AGENTLAB_DATABASE_URL: postgresql+psycopg://agentlab:${POSTGRES_PASSWORD:-agentlab}@postgres:5432/agentlab
+      GIT_COMMIT: ${GIT_COMMIT:-unknown}
+      AGENTLAB_DATABASE_URL: postgresql+psycopg://agentlab:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/agentlab
       AGENTLAB_REDIS_URL: redis://redis:6379/0
       AGENTLAB_QUEUE_MODE: celery
       AGENTLAB_AUTH_MODE: required
-      AGENTLAB_API_KEY: ${AGENTLAB_API_KEY:?Set AGENTLAB_API_KEY in .env}
+      AGENTLAB_TRACE_CAPTURE: ${AGENTLAB_TRACE_CAPTURE:-redacted}
+      AGENTLAB_PROVIDER_TIMEOUT_SECONDS: ${AGENTLAB_PROVIDER_TIMEOUT_SECONDS:-45}
+      AGENTLAB_ENABLE_LLM_JUDGE: ${AGENTLAB_ENABLE_LLM_JUDGE:-false}
+      AGENTLAB_JUDGE_MODEL: ${AGENTLAB_JUDGE_MODEL:-}
+      AGENTLAB_JUDGE_API_KEY: ${AGENTLAB_JUDGE_API_KEY:-}
+      AGENTLAB_JUDGE_BASE_URL: ${AGENTLAB_JUDGE_BASE_URL:-https://api.openai.com/v1}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
@@ -62,6 +65,7 @@ services:
       AGENTLAB_OLLAMA_BASE_URL: ${AGENTLAB_OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       AGENTLAB_CUSTOM_HTTP_URL: ${AGENTLAB_CUSTOM_HTTP_URL:-}
     command: ["celery", "-A", "agentlab.worker.celery_app", "worker", "-l", "info", "--concurrency=4"]
+    extra_hosts: ["host.docker.internal:host-gateway"]
     depends_on:
       postgres: {condition: service_healthy}
       redis: {condition: service_healthy}
@@ -74,8 +78,11 @@ services:
     environment:
       API_INTERNAL_URL: http://backend:8000
       BACKEND_API_KEY: ${AGENTLAB_API_KEY:?Set AGENTLAB_API_KEY in .env}
+      WEB_AUTH_MODE: required
+      WEB_ACCESS_KEY: ${WEB_ACCESS_KEY:?Set WEB_ACCESS_KEY in .env}
+      WEB_SESSION_SECRET: ${WEB_SESSION_SECRET:?Set WEB_SESSION_SECRET in .env}
     depends_on: [backend]
-    ports: ["3000:3000"]
+    ports: ["${AGENTLAB_BIND_ADDRESS:-127.0.0.1}:3000:3000"]
     restart: unless-stopped
 volumes:
   pgdata:

@@ -1,11 +1,11 @@
 from agentlab.db import get_db
 from agentlab.demo import seed
-from agentlab.executions import create_experiment, dispatch_experiment, queue_experiment
+from agentlab.executions import create_experiment, queue_experiment
 from agentlab.schemas import DemoRunIn, ExperimentIn
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy.orm import Session
 
-from agentlab_api.common import audit
+from agentlab_api.common import audit, dispatch_or_unavailable
 
 router = APIRouter(prefix="/demo", tags=["Clearly labeled DEMO fixtures"])
 
@@ -49,7 +49,7 @@ def run_demo(body: DemoRunIn, request: Request, db: Session = Depends(get_db)):
     audit(db, request, "demo.run", "demo", ids["agent_id"], {"experiment_ids": exps})
     db.commit()
     for experiment_id in exps:
-        dispatch_experiment(experiment_id)
+        dispatch_or_unavailable(experiment_id)
     return {
         "label": "DEMO · scores will be MEASURED from 100 executed mock runs",
         "baseline_experiment_id": exps[0],

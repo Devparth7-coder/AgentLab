@@ -53,7 +53,10 @@ def new_agent(db: Session, data: AgentIn, is_demo: bool = False) -> m.Agent:
     if db.scalar(select(m.Agent.id).where(m.Agent.name == data.name)):
         raise ValueError("Agent name already registered")
     agent = m.Agent(
-        name=data.name, description=data.description, provider=data.provider, is_demo=is_demo
+        name=data.name,
+        description=data.description,
+        provider=data.provider,
+        is_demo=is_demo or data.provider == "mock",
     )
     db.add(agent)
     db.flush()

@@ -142,10 +142,46 @@ def cost_summary(experiment_id: str, db: Session = Depends(get_db)):
     total = db.scalar(
         select(m.Metric).where(m.Metric.experiment_id == ex.id, m.Metric.key == "total_tokens")
     )
+    from agentlab.metrics import percentile
+
+    calls = db.scalars(
+        select(m.ToolCall)
+        .join(m.Trace, m.ToolCall.trace_id == m.Trace.id)
+        .where(m.Trace.experiment_id == ex.id)
+    ).all()
+    by_tool = {}
+    for call in calls:
+        by_tool.setdefault(call.tool_name, []).append(call.duration_ms)
+    known_api_calls = [r.api_calls for r in records if r.api_calls is not None]
+    completed_count = (
+        db.scalar(
+            select(func.count())
+            .select_from(m.ExperimentRun)
+            .where(
+                m.ExperimentRun.experiment_id == ex.id,
+                m.ExperimentRun.status.in_(["PASSED", "FAILED", "ERROR"]),
+            )
+        )
+        or 0
+    )
     return {
         "experiment_id": ex.id,
         "estimated_cost_usd": row(cost) if cost else None,
         "total_tokens": row(total) if total else None,
+        "api_calls": sum(known_api_calls)
+        if completed_count and len(known_api_calls) == completed_count
+        else None,
+        "api_call_coverage": f"{len(known_api_calls)}/{completed_count}",
+        "tool_calls": len(calls),
+        "tool_breakdown": [
+            {
+                "tool_name": name,
+                "calls": len(samples),
+                "average_ms": round(sum(samples) / len(samples), 3),
+                "p95_ms": percentile(samples, 0.95),
+            }
+            for name, samples in sorted(by_tool.items(), key=lambda p: -sum(p[1]) / len(p[1]))
+        ],
         "records": [row(r) for r in records],
         "note": "Cost excludes LLM judge and tool fees. Null means Not measured; partial coverage is never displayed as total.",
     }

@@ -1,7 +1,9 @@
 from agentlab import models as m
 from agentlab.db import get_db
+from agentlab.report_pdf import pdf_bytes
 from agentlab.reports import generate
 from agentlab.schemas import ListFilter, ReportIn
+from agentlab.serializers import iso_utc
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -26,8 +28,9 @@ def reports(
         {
             "id": x.id,
             "title": x.title,
+            "is_demo": bool(x.content_json.get("demo")),
             "experiment_id": x.experiment_id,
-            "created_at": x.created_at.isoformat(),
+            "created_at": iso_utc(x.created_at),
         }
         for x in db.scalars(
             q.order_by(m.Report.created_at.desc()).offset(f.offset).limit(f.limit)
@@ -45,8 +48,9 @@ def create(body: ReportIn, request: Request, db: Session = Depends(get_db)):
         return {
             "id": report.id,
             "title": report.title,
+            "is_demo": bool(report.content_json.get("demo")),
             "experiment_id": ex.id,
-            "created_at": report.created_at.isoformat(),
+            "created_at": iso_utc(report.created_at),
         }
     except ValueError as exc:
         db.rollback()
@@ -59,16 +63,25 @@ def detail(report_id: str, db: Session = Depends(get_db)):
     return {
         "id": report.id,
         "title": report.title,
+        "is_demo": bool(report.content_json.get("demo")),
         "experiment_id": report.experiment_id,
-        "created_at": report.created_at.isoformat(),
+        "created_at": iso_utc(report.created_at),
         "content_json": report.content_json,
         "content_markdown": report.content_markdown,
     }
 
 
-@router.get("/{report_id}/download", summary="Export Markdown, JSON or standalone print-ready HTML")
+@router.get(
+    "/{report_id}/download", summary="Export PDF, Markdown, JSON or standalone print-ready HTML"
+)
 def download(report_id: str, format: str = "md", db: Session = Depends(get_db)):
     report = found(db, m.Report, report_id)
+    if format == "pdf":
+        return Response(
+            pdf_bytes(report.content_json),
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="agentlab-{report.id}.pdf"'},
+        )
     if format == "md":
         return Response(
             report.content_markdown,
@@ -92,4 +105,4 @@ def download(report_id: str, format: str = "md", db: Session = Depends(get_db)):
             media_type="application/json",
             headers={"Content-Disposition": f'attachment; filename="agentlab-{report.id}.json"'},
         )
-    raise HTTPException(400, "Supported formats: md, json, html")
+    raise HTTPException(400, "Supported formats: pdf, md, json, html")

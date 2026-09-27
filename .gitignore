@@ -16,3 +16,6 @@ build/
 *.egg-info/
 coverage/
 *.log
+*.tsbuildinfo
+playwright-report/
+test-results/

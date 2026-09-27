@@ -1,5 +1,7 @@
 """API response helpers and append-only mutation auditing."""
 
+import logging
+
 from agentlab import models as m
 from fastapi import HTTPException, Request
 from sqlalchemy.orm import Session
@@ -34,3 +36,22 @@ def audit(
             details=details or {},
         )
     )
+
+
+def dispatch_or_unavailable(experiment_id: str) -> int:
+    """A committed QUEUED run remains durable if the broker is unavailable."""
+    from agentlab.executions import dispatch_experiment
+
+    try:
+        return dispatch_experiment(experiment_id)
+    except Exception as exc:
+        # Never return or log a broker connection string; it can contain credentials.
+        logging.getLogger("agentlab.dispatch").warning(
+            "dispatch_unavailable experiment_id=%s error_type=%s",
+            experiment_id,
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=f"Worker dispatch unavailable. Runs remain queued; retry /experiments/{experiment_id}/resume after restoring the broker.",
+        ) from None

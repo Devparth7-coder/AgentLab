@@ -11,6 +11,8 @@ COMPARATOR_VERSION = "paired-1.0.0"
 def compare(db: Session, baseline: m.Experiment, candidate: m.Experiment) -> m.Regression:
     if baseline.id == candidate.id:
         raise ValueError("Choose two distinct experiments")
+    if baseline.status != "COMPLETED" or candidate.status != "COMPLETED":
+        raise ValueError("Both experiments must be completed before freezing a comparison")
     existing = db.scalar(
         select(m.Regression).where(
             m.Regression.baseline_experiment_id == baseline.id,
