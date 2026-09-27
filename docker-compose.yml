@@ -1,0 +1,82 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: agentlab
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-agentlab}
+      POSTGRES_DB: agentlab
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agentlab"]
+      interval: 3s
+      retries: 20
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    volumes: ["redisdata:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      retries: 20
+  backend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    environment:
+      AGENTLAB_ENV: ${AGENTLAB_ENV:-development}
+      AGENTLAB_DATABASE_URL: postgresql+psycopg://agentlab:${POSTGRES_PASSWORD:-agentlab}@postgres:5432/agentlab
+      AGENTLAB_REDIS_URL: redis://redis:6379/0
+      AGENTLAB_QUEUE_MODE: celery
+      AGENTLAB_AUTH_MODE: required
+      AGENTLAB_API_KEY: ${AGENTLAB_API_KEY:?Set AGENTLAB_API_KEY in .env}
+      AGENTLAB_DEMO_SEED: ${AGENTLAB_DEMO_SEED:-true}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      HF_TOKEN: ${HF_TOKEN:-}
+      AGENTLAB_OPENAI_BASE_URL: ${AGENTLAB_OPENAI_BASE_URL:-https://api.openai.com/v1}
+      AGENTLAB_OLLAMA_BASE_URL: ${AGENTLAB_OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      AGENTLAB_CUSTOM_HTTP_URL: ${AGENTLAB_CUSTOM_HTTP_URL:-}
+    command: ["sh", "-c", "alembic upgrade head && uvicorn agentlab_api.main:app --host 0.0.0.0 --port 8000"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    ports: ["8000:8000"]
+    restart: unless-stopped
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    environment:
+      AGENTLAB_ENV: ${AGENTLAB_ENV:-development}
+      AGENTLAB_DATABASE_URL: postgresql+psycopg://agentlab:${POSTGRES_PASSWORD:-agentlab}@postgres:5432/agentlab
+      AGENTLAB_REDIS_URL: redis://redis:6379/0
+      AGENTLAB_QUEUE_MODE: celery
+      AGENTLAB_AUTH_MODE: required
+      AGENTLAB_API_KEY: ${AGENTLAB_API_KEY:?Set AGENTLAB_API_KEY in .env}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      HF_TOKEN: ${HF_TOKEN:-}
+      AGENTLAB_OPENAI_BASE_URL: ${AGENTLAB_OPENAI_BASE_URL:-https://api.openai.com/v1}
+      AGENTLAB_OLLAMA_BASE_URL: ${AGENTLAB_OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      AGENTLAB_CUSTOM_HTTP_URL: ${AGENTLAB_CUSTOM_HTTP_URL:-}
+    command: ["celery", "-A", "agentlab.worker.celery_app", "worker", "-l", "info", "--concurrency=4"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      backend: {condition: service_started}
+    restart: unless-stopped
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.web
+    environment:
+      API_INTERNAL_URL: http://backend:8000
+      BACKEND_API_KEY: ${AGENTLAB_API_KEY:?Set AGENTLAB_API_KEY in .env}
+    depends_on: [backend]
+    ports: ["3000:3000"]
+    restart: unless-stopped
+volumes:
+  pgdata:
+  redisdata:
